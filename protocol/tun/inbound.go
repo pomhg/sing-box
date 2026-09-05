@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -59,6 +60,7 @@ type Inbound struct {
 	routeExcludeRuleSetCallback []*list.Element[adapter.RuleSetUpdateCallback]
 	routeAddressSet             []*netipx.IPSet
 	routeExcludeAddressSet      []*netipx.IPSet
+	autoRedirectAddressSets     atomic.Pointer[autoRedirectAddressSets]
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TunInboundOptions) (adapter.Inbound, error) {
@@ -261,16 +263,15 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		}
 		disableNFTables, dErr := strconv.ParseBool(os.Getenv("DISABLE_NFTABLES"))
 		inbound.autoRedirect, err = tun.NewAutoRedirect(tun.AutoRedirectOptions{
-			TunOptions:             &inbound.tunOptions,
-			Context:                ctx,
-			Handler:                (*autoRedirectHandler)(inbound),
-			Logger:                 logger,
-			NetworkMonitor:         networkManager.NetworkMonitor(),
-			InterfaceFinder:        networkManager.InterfaceFinder(),
-			TableName:              "sing-box",
-			DisableNFTables:        dErr == nil && disableNFTables,
-			RouteAddressSet:        &inbound.routeAddressSet,
-			RouteExcludeAddressSet: &inbound.routeExcludeAddressSet,
+			TunOptions:      &inbound.tunOptions,
+			Context:         ctx,
+			Handler:         (*autoRedirectHandler)(inbound),
+			Logger:          logger,
+			NetworkMonitor:  networkManager.NetworkMonitor(),
+			InterfaceFinder: networkManager.InterfaceFinder(),
+			TableName:       "sing-box",
+			DisableNFTables: dErr == nil && disableNFTables,
+			RouteAddressSet: inbound.fetchAutoRedirectAddressSets,
 		})
 		if err != nil {
 			return nil, E.Cause(err, "initialize auto-redirect")
@@ -484,6 +485,7 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
 			return E.Cause(err, "starting TUN interface")
 		}
 		if t.autoRedirect != nil {
+			t.refreshAutoRedirectAddressSets()
 			monitor.Start("initialize auto-redirect")
 			err := t.autoRedirect.Start()
 			monitor.Finish()
@@ -498,11 +500,10 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
 }
 
 func (t *Inbound) updateRouteAddressSet(it adapter.RuleSet) {
-	t.routeAddressSet = common.FlatMap(t.routeRuleSet, adapter.RuleSet.ExtractIPSet)
-	t.routeExcludeAddressSet = common.FlatMap(t.routeExcludeRuleSet, adapter.RuleSet.ExtractIPSet)
-	t.autoRedirect.UpdateRouteAddressSet()
-	t.routeAddressSet = nil
-	t.routeExcludeAddressSet = nil
+	t.refreshAutoRedirectAddressSets()
+	if err := t.autoRedirect.UpdateRouteAddressSet(); err != nil {
+		t.logger.Error(E.Cause(err, "update auto-redirect route address set"))
+	}
 }
 
 func (t *Inbound) InterfaceUpdated(ctx context.Context) {
@@ -586,6 +587,9 @@ func (t *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 type autoRedirectHandler Inbound
 
 func (t *autoRedirectHandler) JudgeFlow(network uint8, source netip.AddrPort, destination netip.AddrPort, firstPacket []byte) tun.FlowVerdict {
+	if (*Inbound)(t).bypassAutoRedirectAddress(destination.Addr()) {
+		return tun.FlowVerdict{Action: tun.ActionBypass}
+	}
 	return (*Inbound)(t).JudgeFlow(network, source, destination, firstPacket)
 }
 
