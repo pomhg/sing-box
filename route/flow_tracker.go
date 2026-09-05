@@ -2,6 +2,7 @@ package route
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -14,8 +15,44 @@ import (
 
 var (
 	_ tun.FlowTracker = (*flowLogger)(nil)
+	_ tun.FlowTracker = (*flowReleaseTracker)(nil)
 	_ tun.FlowTracker = multiFlowTracker(nil)
 )
+
+type flowReleaseTracker struct {
+	access   sync.Once
+	releases []func()
+}
+
+func newFlowReleaseTracker(acquires []func() func()) *flowReleaseTracker {
+	releases := make([]func(), 0, len(acquires))
+	for _, acquire := range acquires {
+		if release := acquire(); release != nil {
+			releases = append(releases, release)
+		}
+	}
+	return &flowReleaseTracker{releases: releases}
+}
+
+func (t *flowReleaseTracker) AttachFlow(tun.FlowHandle) {}
+
+func (t *flowReleaseTracker) CountForward(int) {}
+
+func (t *flowReleaseTracker) CountReverse(int) {}
+
+func (t *flowReleaseTracker) FlowEstablished() {}
+
+func (t *flowReleaseTracker) CloseFlow(tun.FlowCloseReason) {
+	t.access.Do(func() {
+		releasePreMatchOutbounds(t.releases)
+	})
+}
+
+func releasePreMatchOutbounds(releases []func()) {
+	for index := len(releases) - 1; index >= 0; index-- {
+		releases[index]()
+	}
+}
 
 type flowLogger struct {
 	ctx         context.Context

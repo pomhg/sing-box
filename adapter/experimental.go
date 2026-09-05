@@ -8,6 +8,7 @@ import (
 	"time"
 
 	E "github.com/sagernet/sing/common/exceptions"
+	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/observable"
 	"github.com/sagernet/sing/common/varbin"
 )
@@ -161,6 +162,12 @@ type OutboundGroup interface {
 	Outbound
 	Now() string
 	All() []string
+}
+
+type PreMatchOutboundGroup interface {
+	OutboundGroup
+	// The optional callback starts accounting when a flow is created and returns its release function.
+	SelectPreMatchOutbound(network string, destination M.Socksaddr) (Outbound, func() func())
 }
 
 type URLTestGroup interface {

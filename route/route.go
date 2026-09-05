@@ -439,6 +439,7 @@ func applyRouteOptionsOverride(metadata *adapter.InboundContext, routeOptions *R
 
 func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundContext, packetDestination M.Socksaddr, matchedRule adapter.Rule, outboundTag string) adapter.PreMatchResult {
 	continueResult := adapter.PreMatchResult{Action: adapter.PreMatchContinue}
+	var groupAcquires []func() func()
 	var outbound adapter.Outbound
 	if outboundTag == "" {
 		outbound = r.outbound.Default()
@@ -454,11 +455,22 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
 		if !isGroup {
 			break
 		}
-		selectedOutbound, selectedLoaded := r.outbound.Outbound(group.Now())
-		if !selectedLoaded {
-			return continueResult
+		if preMatchGroup, isPreMatchGroup := group.(adapter.PreMatchOutboundGroup); isPreMatchGroup {
+			selectedOutbound, acquire := preMatchGroup.SelectPreMatchOutbound(metadata.Network, metadata.Destination)
+			if selectedOutbound == nil {
+				return continueResult
+			}
+			if acquire != nil {
+				groupAcquires = append(groupAcquires, acquire)
+			}
+			outbound = selectedOutbound
+		} else {
+			selectedOutbound, selectedLoaded := r.outbound.Outbound(group.Now())
+			if !selectedLoaded {
+				return continueResult
+			}
+			outbound = selectedOutbound
 		}
-		outbound = selectedOutbound
 	}
 	if !common.Contains(outbound.Network(), metadata.Network) {
 		return continueResult
@@ -515,13 +527,16 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
 	r.logger.InfoContext(ctx, "pre-match: forward ", metadata.Network, " connection from ", metadata.Source.AddrString(), " to ", metadata.Destination.AddrString(), " via outbound/", outbound.Type(), "[", outbound.Tag(), "]")
 	metadataCopy := *metadata
 	result.NewTracker = func() tun.FlowTracker {
-		flowTrackers := make([]tun.FlowTracker, 0, len(r.trackers)+1)
+		flowTrackers := make([]tun.FlowTracker, 0, len(r.trackers)+2)
 		flowTrackers = append(flowTrackers, newFlowLogger(ctx, r.logger, metadataCopy, outbound))
 		for _, tracker := range r.trackers {
 			flowTracker := tracker.RoutedFlow(ctx, metadataCopy, matchedRule, outbound)
 			if flowTracker != nil {
 				flowTrackers = append(flowTrackers, flowTracker)
 			}
+		}
+		if len(groupAcquires) > 0 {
+			flowTrackers = append(flowTrackers, newFlowReleaseTracker(groupAcquires))
 		}
 		if len(flowTrackers) == 1 {
 			return flowTrackers[0]

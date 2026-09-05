@@ -13482,6 +13482,24 @@
                 "x-tag-reference": "outbound"
               }
             },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "least_ping",
+                "failover",
+                "round_robin",
+                "random",
+                "least_connection",
+                "weighted_round_robin",
+                "consistent_hash"
+              ]
+            },
+            "weights": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/URLTestWeight"
+              }
+            },
             "url": {
               "type": "string"
             },
@@ -17084,6 +17102,21 @@
           "pattern": "^[-+]?(((\\d+(\\.\\d*)?|\\.\\d+)(ns|us|µs|μs|ms|s|m|h|d))+|0)$"
         }
       ]
+    },
+    "URLTestWeight": {
+      "type": "object",
+      "properties": {
+        "outbound": {
+          "type": "string",
+          "x-tag-reference": "outbound"
+        },
+        "weight": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        }
+      },
+      "additionalProperties": false
     },
     "USBIPDeviceMatch": {
       "type": "object",
