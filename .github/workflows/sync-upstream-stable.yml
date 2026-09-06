@@ -1,0 +1,211 @@
+name: Build released upstream stable with URLTest and flow_nat patches
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-released-upstream-stable
+  cancel-in-progress: false
+
+jobs:
+  build-release:
+    if: github.repository == 'pomhg/sing-box'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout stable
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          ref: stable
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: 1.25.12
+          cache: true
+
+      - name: Check for a new upstream stable release
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream https://github.com/SagerNet/sing-box.git
+          else
+            git remote add upstream https://github.com/SagerNet/sing-box.git
+          fi
+          git fetch --force --tags upstream stable
+
+          mapfile -t patch_commits < <(git log --reverse --format=%H --grep='Fork-Patch: urltest-load-balance' --grep='Fork-Patch: sing-tun-dev-compat')
+          automation_commit="$(git log -1 --format=%H --grep='Fork-Automation: stable-release-build')"
+          if [[ "${#patch_commits[@]}" -eq 0 ]]; then
+            echo "URLTest load-balance patch commit was not found" >&2
+            exit 1
+          fi
+          if [[ -z "${automation_commit}" ]]; then
+            echo "Stable release automation commit was not found" >&2
+            exit 1
+          fi
+
+          upstream_tag=""
+          while IFS= read -r candidate; do
+            if [[ "${candidate}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              upstream_tag="${candidate}"
+              break
+            fi
+          done < <(git tag --merged upstream/stable --sort=-version:refname)
+          if [[ -z "${upstream_tag}" ]]; then
+            echo "No stable semantic-version tag was found on upstream/stable" >&2
+            exit 1
+          fi
+
+          upstream_sha="$(git rev-list -n 1 "${upstream_tag}")"
+          upstream_short="$(git rev-parse --short=8 "${upstream_sha}")"
+          sing_tun_upstream_sha="$(git ls-remote https://github.com/SagerNet/sing-tun.git refs/heads/dev | awk '{print $1}')"
+          if [[ ! "${sing_tun_upstream_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Unable to resolve upstream sing-tun/dev" >&2
+            exit 1
+          fi
+          sing_tun_short="${sing_tun_upstream_sha:0:8}"
+          sing_tun_tag="v0.9.0-dev.${sing_tun_short}-pomhg.3"
+          if ! git ls-remote --exit-code --tags https://github.com/pomhg/sing-tun.git "refs/tags/${sing_tun_tag}" >/dev/null 2>&1; then
+            echo "Required upstream-dev patch tag is not available: ${sing_tun_tag}" >&2
+            echo "Run pomhg/sing-tun maintain-flow-nat before retrying this workflow." >&2
+            exit 1
+          fi
+          version="${upstream_tag#v}-urltest-lb-flow-nat.${upstream_short}.dev.${sing_tun_short}.r3"
+          release_tag="v${version}"
+
+          echo "upstream_sha=${upstream_sha}" >> "${GITHUB_OUTPUT}"
+          echo "upstream_tag=${upstream_tag}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "release_tag=${release_tag}" >> "${GITHUB_OUTPUT}"
+
+          if gh release view "${release_tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            echo "Release ${release_tag} already exists; source and binary remain unchanged."
+            exit 0
+          fi
+
+          echo "skip=false" >> "${GITHUB_OUTPUT}"
+          automation_file="${RUNNER_TEMP}/sync-upstream-stable.yml"
+          git show "${automation_commit}:.github/workflows/sync-upstream-stable.yml" > "${automation_file}"
+
+          git reset --hard "${upstream_sha}"
+          git cherry-pick "${patch_commits[@]}"
+
+          go mod edit -replace="github.com/sagernet/sing-tun=github.com/pomhg/sing-tun@${sing_tun_tag}"
+          go mod tidy
+          echo "sing_tun_tag=${sing_tun_tag}" >> "${GITHUB_OUTPUT}"
+
+          mkdir -p .github/workflows
+          find .github/workflows -type f -delete
+          cp "${automation_file}" .github/workflows/sync-upstream-stable.yml
+          git add go.mod go.sum .github/workflows
+          git commit \
+            -m "ci: build released upstream stable" \
+            -m "Fork-Automation: stable-release-build"
+
+          echo "build_commit=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - name: Test URLTest, flow_nat, and pre-match routing
+        if: steps.prepare.outputs.skip != 'true'
+        run: go test -race github.com/sagernet/sing-tun ./protocol/tun ./protocol/group ./route
+
+      - name: Build Linux amd64
+        if: steps.prepare.outputs.skip != 'true'
+        id: build
+        env:
+          BUILD_VERSION: ${{ steps.prepare.outputs.version }}
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: amd64
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_tags="$(cat release/DEFAULT_BUILD_TAGS),with_purego"
+          shared_ldflags="$(cat release/LDFLAGS)"
+          asset="sing-box-${BUILD_VERSION}-linux-amd64"
+          mkdir -p dist
+          go build -v -trimpath -o "dist/${asset}" \
+            -tags "${build_tags}" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${BUILD_VERSION}' ${shared_ldflags} -s -w -buildid=" \
+            ./cmd/sing-box
+          version_output="$("dist/${asset}" version)"
+          echo "${version_output}"
+          grep -q "with_naive_outbound" <<< "${version_output}"
+          sha256sum "dist/${asset}" > "dist/${asset}.sha256"
+          echo "asset=${asset}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload workflow artifact
+        if: steps.prepare.outputs.skip != 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: sing-box-${{ steps.prepare.outputs.version }}-linux-amd64
+          path: |
+            dist/${{ steps.build.outputs.asset }}
+            dist/${{ steps.build.outputs.asset }}.sha256
+          if-no-files-found: error
+
+      - name: Replace stable with the released source and patch
+        if: steps.prepare.outputs.skip != 'true'
+        run: git push --force-with-lease origin HEAD:stable
+
+      - name: Create GitHub release
+        if: steps.prepare.outputs.skip != 'true'
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.prepare.outputs.release_tag }}
+          UPSTREAM_SHA: ${{ steps.prepare.outputs.upstream_sha }}
+          UPSTREAM_TAG: ${{ steps.prepare.outputs.upstream_tag }}
+          BUILD_COMMIT: ${{ steps.prepare.outputs.build_commit }}
+          SING_TUN_TAG: ${{ steps.prepare.outputs.sing_tun_tag }}
+          ASSET: ${{ steps.build.outputs.asset }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "${RELEASE_TAG}" \
+            "dist/${ASSET}" \
+            "dist/${ASSET}.sha256" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${BUILD_COMMIT}" \
+            --title "sing-box ${RELEASE_TAG} Linux amd64" \
+            --notes "Based exactly on SagerNet/sing-box ${UPSTREAM_TAG} (${UPSTREAM_SHA}) with pomhg/sing-tun ${SING_TUN_TAG} based on upstream sing-tun dev (including the pre-match-before-DNAT fix). Includes Naive outbound, best-effort UDP source-port preservation, safe IPv4/IPv6 return-fragment reassembly before reverse NAT, and URLTest modes: least_ping, failover, round_robin, random, least_connection, weighted_round_robin, and consistent_hash. This release contains the Linux amd64 executable only; install libcronet.so separately when using Naive outbound."
+
+      - name: Remove older custom releases and tags
+        if: always() && steps.prepare.outcome == 'success' && (steps.prepare.outputs.skip == 'true' || steps.release.outcome == 'success')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.prepare.outputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_pattern='^v[0-9]+\.[0-9]+\.[0-9]+-urltest-lb(-flow-nat)?\.[0-9a-f]{8}(\.dev\.[0-9a-f]{8})?(\.r[0-9]+)?$'
+
+          while IFS= read -r old_tag; do
+            if [[ -n "${old_tag}" && "${old_tag}" != "${RELEASE_TAG}" && "${old_tag}" =~ ${release_pattern} ]]; then
+              gh release delete "${old_tag}" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --cleanup-tag \
+                --yes
+            fi
+          done < <(gh release list --repo "${GITHUB_REPOSITORY}" --limit 1000 --json tagName --jq '.[].tagName')
+
+          while read -r _ ref; do
+            tag="${ref#refs/tags/}"
+            if [[ "${tag}" != "${RELEASE_TAG}" && "${tag}" =~ ${release_pattern} ]]; then
+              git push origin ":${ref}"
+            fi
+          done < <(git ls-remote --tags --refs origin 'refs/tags/v*-urltest-lb.*')
