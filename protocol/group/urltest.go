@@ -32,9 +32,10 @@ func RegisterURLTest(registry *outbound.Registry) {
 }
 
 var (
-	_ adapter.OutboundGroup           = (*URLTest)(nil)
-	_ adapter.InterfaceUpdateListener = (*URLTest)(nil)
-	_ adapter.Referrer                = (*URLTest)(nil)
+	_ adapter.OutboundGroup            = (*URLTest)(nil)
+	_ adapter.DestinationOutboundGroup = (*URLTest)(nil)
+	_ adapter.InterfaceUpdateListener  = (*URLTest)(nil)
+	_ adapter.Referrer                 = (*URLTest)(nil)
 )
 
 type URLTest struct {
@@ -46,6 +47,7 @@ type URLTest struct {
 	link                         string
 	interval                     time.Duration
 	tolerance                    uint16
+	mode                         string
 	idleTimeout                  time.Duration
 	group                        *URLTestGroup
 	checkAccess                  sync.Mutex
@@ -53,6 +55,14 @@ type URLTest struct {
 }
 
 func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.URLTestOutboundOptions) (adapter.Outbound, error) {
+	mode := options.Mode
+	switch mode {
+	case "":
+		mode = URLTestModeLeastPing
+	case URLTestModeLeastPing, URLTestModeFailover, URLTestModeConsistentHash:
+	default:
+		return nil, E.New("unknown urltest mode: ", mode)
+	}
 	outbound := &URLTest{
 		Adapter:                      outbound.NewAdapter(C.TypeURLTest, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.Outbounds),
 		ctx:                          ctx,
@@ -62,6 +72,7 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 		link:                         options.URL,
 		interval:                     time.Duration(options.Interval),
 		tolerance:                    options.Tolerance,
+		mode:                         mode,
 		idleTimeout:                  time.Duration(options.IdleTimeout),
 		interruptExternalConnections: options.InterruptExistConnections,
 	}
@@ -87,7 +98,7 @@ func (s *URLTest) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 			}
 			outbounds = append(outbounds, detour)
 		}
-		group, err := NewURLTestGroup(s.ctx, s.outbound, s.logger, outbounds, s.link, s.interval, s.tolerance, s.idleTimeout, s.interruptExternalConnections)
+		group, err := NewURLTestGroup(s.ctx, s.outbound, s.logger, outbounds, s.link, s.interval, s.tolerance, s.mode, s.idleTimeout, s.interruptExternalConnections)
 		if err != nil {
 			return err
 		}
@@ -126,6 +137,17 @@ func (s *URLTest) References() ([]string, []string) {
 	if group == nil {
 		return nil, nil
 	}
+	if group.mode == URLTestModeConsistentHash {
+		var references []string
+		for _, network := range []string{N.NetworkTCP, N.NetworkUDP} {
+			for _, detour := range group.candidates(network) {
+				if !common.Contains(references, detour.Tag()) {
+					references = append(references, detour.Tag())
+				}
+			}
+		}
+		return references, nil
+	}
 	var references []string
 	selectedOutboundTCP := group.selectedOutboundTCP.Load()
 	selectedOutboundUDP := group.selectedOutboundUDP.Load()
@@ -136,6 +158,13 @@ func (s *URLTest) References() ([]string, []string) {
 		references = append(references, selectedOutboundUDP.Tag())
 	}
 	return references, nil
+}
+
+func (s *URLTest) SelectedFor(network string, destination M.Socksaddr) adapter.Outbound {
+	if s.group.mode == URLTestModeConsistentHash {
+		return s.group.selectConsistentHash(network, destination)
+	}
+	return s.Selected(network)
 }
 
 func (s *URLTest) URLTest(ctx context.Context) (map[string]uint16, error) {
@@ -181,7 +210,9 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 	default:
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
-	if outbound == nil {
+	if s.group.mode == URLTestModeConsistentHash {
+		outbound = s.group.selectConsistentHash(N.NetworkName(network), destination)
+	} else if outbound == nil {
 		outbound, _ = s.group.Select(network)
 	}
 	if outbound == nil {
@@ -202,7 +233,9 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	s.group.Touch()
 	outbound := s.group.selectedOutboundUDP.Load()
-	if outbound == nil {
+	if s.group.mode == URLTestModeConsistentHash {
+		outbound = s.group.selectConsistentHash(N.NetworkUDP, destination)
+	} else if outbound == nil {
 		outbound, _ = s.group.Select(N.NetworkUDP)
 	}
 	if outbound == nil {
@@ -230,11 +263,14 @@ type URLTestGroup struct {
 	link                         string
 	interval                     time.Duration
 	tolerance                    uint16
+	mode                         string
 	idleTimeout                  time.Duration
 	history                      *urltest.HistoryStorage
 	checking                     atomic.Bool
 	selectedOutboundTCP          common.TypedValue[adapter.Outbound]
 	selectedOutboundUDP          common.TypedValue[adapter.Outbound]
+	candidateTags                map[string][]string
+	testedCandidateTags          map[string][]string
 	interruptGroup               *interrupt.Group
 	interruptExternalConnections bool
 	access                       sync.Mutex
@@ -246,12 +282,15 @@ type URLTestGroup struct {
 	lastActive                   common.TypedValue[time.Time]
 }
 
-func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
+func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, tolerance uint16, mode string, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
 	if interval == 0 {
 		interval = C.DefaultURLTestInterval
 	}
 	if tolerance == 0 {
 		tolerance = 50
+	}
+	if mode == "" {
+		mode = URLTestModeLeastPing
 	}
 	if idleTimeout == 0 {
 		idleTimeout = C.DefaultURLTestIdleTimeout
@@ -271,8 +310,11 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 		link:                         link,
 		interval:                     interval,
 		tolerance:                    tolerance,
+		mode:                         mode,
 		idleTimeout:                  idleTimeout,
 		history:                      history,
+		candidateTags:                make(map[string][]string),
+		testedCandidateTags:          make(map[string][]string),
 		close:                        make(chan struct{}),
 		pause:                        service.FromContext[pause.Manager](ctx),
 		interruptGroup:               interrupt.NewGroup(),
@@ -324,6 +366,9 @@ func (g *URLTestGroup) Close() error {
 }
 
 func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
+	if g.mode != URLTestModeLeastPing {
+		return g.selectFirstAvailable(network)
+	}
 	var minDelay uint16
 	var minOutbound adapter.Outbound
 	var selectedOutbound adapter.Outbound
@@ -405,6 +450,9 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 	defer g.checking.Store(false)
 	result := urlTestOutbounds(ctx, g.outbound, g.history, g.logger, g.outbounds, g.link, g.interval, force)
 	g.performUpdateCheck()
+	if g.mode == URLTestModeConsistentHash {
+		g.interruptIfCandidatesChanged()
+	}
 	g.history.NotifyUpdated()
 	return result, nil
 }
@@ -548,6 +596,11 @@ func (g *URLTestGroup) performUpdateCheck() bool {
 		}
 		g.selectedOutboundUDP.Store(outbound)
 		selected = true
+	}
+	if g.mode == URLTestModeConsistentHash {
+		// Connections are not bound to the selected outbound in this mode,
+		// see interruptIfCandidatesChanged.
+		return g.updateCandidateTags(g.candidateTags) || selected
 	}
 	if updated {
 		g.interruptGroup.Interrupt(g.interruptExternalConnections)
