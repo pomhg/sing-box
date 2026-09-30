@@ -13482,6 +13482,14 @@
                 "x-tag-reference": "outbound"
               }
             },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "least_ping",
+                "failover",
+                "consistent_hash"
+              ]
+            },
             "url": {
               "type": "string"
             },

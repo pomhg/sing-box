@@ -148,7 +148,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	if selectedRule == nil {
 		selectedOutbound = r.outbound.Default()
 	}
-	chain, err := resolveOutbound(selectedOutbound, N.NetworkTCP)
+	chain, err := resolveOutbound(selectedOutbound, N.NetworkTCP, metadata.Destination)
 	if err != nil {
 		buf.ReleaseMulti(buffers)
 		return err
@@ -175,14 +175,18 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	return nil
 }
 
-func resolveOutbound(outbound adapter.Outbound, network string) ([]adapter.Outbound, error) {
+func resolveOutbound(outbound adapter.Outbound, network string, destination M.Socksaddr) ([]adapter.Outbound, error) {
 	chain := []adapter.Outbound{outbound}
 	for {
 		group, isGroup := outbound.(adapter.OutboundGroup)
 		if !isGroup {
 			break
 		}
-		outbound = group.Selected(network)
+		if destinationGroup, isDestinationGroup := group.(adapter.DestinationOutboundGroup); isDestinationGroup {
+			outbound = destinationGroup.SelectedFor(network, destination)
+		} else {
+			outbound = group.Selected(network)
+		}
 		if outbound == nil {
 			return nil, E.New(strings.ToUpper(network), " is not supported by outbound: ", group.Tag())
 		}
@@ -313,7 +317,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 	if selectedRule == nil || selectReturn {
 		selectedOutbound = r.outbound.Default()
 	}
-	chain, err := resolveOutbound(selectedOutbound, N.NetworkUDP)
+	chain, err := resolveOutbound(selectedOutbound, N.NetworkUDP, metadata.Destination)
 	if err != nil {
 		N.ReleaseMultiPacketBuffer(packetBuffers)
 		return err
@@ -491,7 +495,7 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
 			return continueResult
 		}
 	}
-	chain, err := resolveOutbound(outbound, metadata.Network)
+	chain, err := resolveOutbound(outbound, metadata.Network, metadata.Destination)
 	if err != nil {
 		return continueResult
 	}

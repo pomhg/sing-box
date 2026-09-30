@@ -10,6 +10,7 @@ type SelectorOutboundOptions struct {
 
 type URLTestOutboundOptions struct {
 	Outbounds                 []string           `json:"outbounds" reference:"outbound"`
+	Mode                      string             `json:"mode,omitempty" enum:"least_ping,failover,consistent_hash"`
 	URL                       string             `json:"url,omitempty"`
 	Interval                  badoption.Duration `json:"interval,omitempty"`
 	Tolerance                 uint16             `json:"tolerance,omitempty"`
