@@ -8,6 +8,7 @@ import (
 	"time"
 
 	E "github.com/sagernet/sing/common/exceptions"
+	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/varbin"
 )
 
@@ -152,6 +153,11 @@ type OutboundGroup interface {
 	Outbound
 	Now() string
 	All() []string
+}
+
+type PreMatchOutboundGroup interface {
+	OutboundGroup
+	SelectPreMatchOutbound(network string, destination M.Socksaddr) Outbound
 }
 
 type URLTestGroup interface {
