@@ -465,6 +465,14 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
 		if !isGroup {
 			break
 		}
+		if preMatchGroup, isPreMatchGroup := group.(adapter.PreMatchOutboundGroup); isPreMatchGroup {
+			selectedOutbound := preMatchGroup.SelectPreMatchOutbound(metadata.Network, metadata.Destination)
+			if selectedOutbound == nil {
+				return continueResult
+			}
+			outbound = selectedOutbound
+			continue
+		}
 		selectedOutbound, selectedLoaded := r.outbound.Outbound(group.Now())
 		if !selectedLoaded {
 			return continueResult
