@@ -8,6 +8,7 @@ import (
 	"time"
 
 	E "github.com/sagernet/sing/common/exceptions"
+	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/varbin"
 )
 
@@ -153,6 +154,11 @@ type OutboundGroup interface {
 	All() []string
 	Selected(network string) Outbound
 	AttachConnection(closer io.Closer) (detach func())
+}
+
+type DestinationOutboundGroup interface {
+	OutboundGroup
+	SelectedFor(network string, destination M.Socksaddr) Outbound
 }
 
 type URLTestGroup interface {
